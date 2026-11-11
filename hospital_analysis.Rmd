@@ -1,0 +1,597 @@
+---
+title: "R Assignment – Group 7: Hospital (Admissions, Length of Stay and Cost)"
+subtitle: "MIDA-B – R&Python programming for business and management"
+author: "Group 7: Adriana Bonanca García, Fernando Herráiz Nieto Márquez, Juan María Rodríguez Estrada"
+date: "8 November 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+# Show the code in the document and hide package start-up messages
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. Setup
+
+```{r libraries}
+# Load every library used in the document
+library(dplyr)      # data manipulation (filter, select, mutate, group_by, summarise)
+library(tidyr)      # pivot_wider to reshape small tables
+library(ggplot2)    # charts
+library(lubridate)  # dates and days of the week
+
+# Colours used in all charts: one colour for the message, grey for the rest
+col_main  <- "#0E7C86"
+col_grey  <- "#B8BEC6"
+col_loss  <- "#C0392B"
+
+# Folder where the charts for the presentation are saved
+dir.create("charts", showWarnings = FALSE)
+
+# Helper function to write euro amounts in the text (e.g. 190,488 euros)
+# "€" is the euro symbol; negative amounts are written as -€622,966
+eur <- function(x) {
+  amount <- format(abs(round(x)), big.mark = ",", trim = TRUE)
+  ifelse(x < 0, paste0("-€", amount), paste0("€", amount))
+}
+```
+
+# 2. Data loading and first look
+
+```{r load}
+# Read the CSV file by its name only (it is in the same folder as this .Rmd)
+data_raw <- read.csv("Group_7.csv")
+
+# Size of the data: rows and columns
+dim(data_raw)
+```
+
+```{r structure}
+# Type of every column
+str(data_raw)
+```
+
+```{r summary}
+# Summary statistics of every column
+summary(data_raw)
+```
+
+```{r head}
+# First rows only (we never print the whole data)
+head(data_raw)
+```
+
+
+
+# 3. Data quality
+
+```{r copy}
+# Work on a copy so the original data stays untouched
+data_clean <- data_raw
+```
+
+## 3.1 Duplicated rows
+
+```{r duplicates}
+# Count the rows that are exact copies of an earlier row
+n_duplicates <- sum(duplicated(data_clean))
+n_duplicates
+
+# Show which admissions are repeated
+data_clean %>%
+  filter(duplicated(data_clean)) %>%
+  select(admission_id, patient_id, admission_datetime, department)
+
+# Keep only one copy of each row
+data_clean <- distinct(data_clean)
+nrow(data_clean)
+```
+
+**What we found and what we did:** `r n_duplicates` rows were exact copies of another row (same admission_id and identical values in every column). We removed the copies with `distinct()` because the same hospital stay cannot be counted twice: it would inflate admissions, bed-days and costs.
+
+## 3.2 Inconsistent labels
+
+```{r labels}
+# Count the admissions of each department label
+table(data_clean$department)
+
+# Rows written in a different way from the rest
+bad_labels <- c("INTERNAL MEDICINE", "Internal medicine", "Orthopedics")
+n_bad_labels <- sum(data_clean$department %in% bad_labels)
+n_bad_labels
+
+# Write every department in one single way
+data_clean <- data_clean %>%
+  mutate(department = case_when(
+    department %in% c("INTERNAL MEDICINE", "Internal medicine") ~ "Internal Medicine",
+    department == "Orthopedics" ~ "Orthopaedics",
+    TRUE ~ department
+  ))
+
+# Check: now there are only 8 departments
+table(data_clean$department)
+```
+
+**What we found and what we did:** `r n_bad_labels` rows used a different spelling of an existing department ("INTERNAL MEDICINE" and "Internal medicine" for Internal Medicine, "Orthopedics" for Orthopaedics). We renamed them so the hospital has `r n_distinct(data_clean$department)` departments. Without this, Question 1 would show "Orthopedics" as a separate department with only 7 stays and a misleading complication rate.
+
+## 3.3 Impossible values
+
+```{r impossible}
+# Ranges of the numeric columns that cannot be negative or too large
+data_clean %>%
+  select(age, length_of_stay_days, icu_days, cost_eur, reimbursement_eur, hospital_occupancy_pct) %>%
+  summary()
+
+# Stays with a negative length: discharge before admission
+negative_stays <- data_clean %>%
+  filter(length_of_stay_days < 0) %>%
+  select(admission_id, admission_datetime, discharge_datetime, length_of_stay_days)
+negative_stays
+n_negative <- nrow(negative_stays)
+
+# Patients older than 110 years
+too_old <- data_clean %>%
+  filter(age > 110) %>%
+  select(admission_id, age, diagnosis_group)
+too_old
+n_too_old <- nrow(too_old)
+
+# Remove the stays with a negative length (their dates are wrong)
+data_clean <- data_clean %>% filter(length_of_stay_days >= 0)
+
+# Keep the patient older than 110 but delete the impossible age
+data_clean <- data_clean %>% mutate(age = if_else(age > 110, NA, age))
+nrow(data_clean)
+```
+
+**What we found and what we did:** `r n_negative` stays have a discharge date earlier than the admission date, so their length of stay is negative. Their dates are wrong and we cannot know the real stay, so we removed them. `r n_too_old` patient has an age of `r too_old$age[1]` years, which is not possible. Only the age is wrong, so we kept the stay and replaced the age with NA (missing). Costs, payments and occupancy are all within normal ranges.
+
+## 3.4 Missing values
+
+```{r missing}
+# Number of missing values in each column
+colSums(is.na(data_clean))
+
+# The waiting list only exists for planned stays and boarding only for emergencies
+table(admission_type = data_clean$admission_type,
+      waiting_list_missing = is.na(data_clean$waiting_list_days))
+table(admission_type = data_clean$admission_type,
+      ed_boarding_missing = is.na(data_clean$ed_boarding_hours))
+
+n_missing_comorbidity <- sum(is.na(data_clean$comorbidity_index))
+```
+
+**What we found and what we did:** `comorbidity_index` is missing in `r n_missing_comorbidity` stays. This column is not needed for any question, so we kept these rows (removing them would lose costs and stays) and use `na.rm = TRUE` when needed. The missing values in `waiting_list_days` and `ed_boarding_hours` are not errors: the waiting list only exists for planned (elective) stays and boarding only for emergencies and transfers, as the table shows. We also left `age` missing for the patient corrected above.
+
+```{r dates}
+# Convert the date columns from text to date-time so we can get the day of the week
+data_clean <- data_clean %>%
+  mutate(admission_datetime = ymd_hm(admission_datetime),
+         discharge_datetime = ymd_hm(discharge_datetime))
+
+# Final size of the clean data
+dim(data_clean)
+
+# Period covered by the data (first and last admission)
+range(data_clean$admission_datetime)
+```
+
+After cleaning we work with **`r nrow(data_clean)` stays** (from `r nrow(data_raw)` rows). All the questions below use `data_clean`.
+
+
+
+
+# 4. Questions
+
+## Question 1 – Complications by department
+
+*For each department, compute the number of admissions and the complication rate. Which department has the most complications?*
+
+```{r q1}
+# Admissions, complications and complication rate (%) of each department
+q1 <- data_clean %>%
+  group_by(department) %>%
+  summarise(admissions = n(),
+            complications = sum(complications_flag),
+            complication_rate = round(mean(complications_flag) * 100, 1)) %>%
+  arrange(desc(complication_rate))
+q1
+```
+
+```{r q1_chart}
+# Bar chart of the complication rate, highlighting the highest department
+g1 <- ggplot(q1, aes(x = reorder(department, complication_rate), y = complication_rate,
+                     fill = department == q1$department[1])) +
+  geom_col() +
+  geom_text(aes(label = paste0(complication_rate, "%")), hjust = -0.2, size = 5) +
+  coord_flip() +
+  scale_fill_manual(values = c(col_grey, col_main), guide = "none") +
+  scale_y_continuous(limits = c(0, max(q1$complication_rate) * 1.2)) +
+  labs(title = "Complication rate by department",
+       x = NULL, y = "Stays with a complication (%)") +
+  theme_minimal(base_size = 15)
+g1
+ggsave("charts/q1_complications.png", g1, width = 10, height = 5.6, dpi = 200, bg = "white")
+```
+
+**Answer:** `r q1$department[1]` has the most complications: the highest rate (`r q1$complication_rate[1]`%) and also the largest number (`r q1$complications[1]` of its `r q1$admissions[1]` stays), because it is also the biggest department. The rates are quite close, from `r min(q1$complication_rate)`% in `r q1$department[which.min(q1$complication_rate)]` to `r max(q1$complication_rate)`%, so no department stands out by a large margin.
+
+## Question 2 – Mortality by admission type and severity
+
+*Compute the mortality rate for every combination of admission_type and severity_level. Which combination is the most dangerous?*
+
+```{r q2}
+# Mortality rate (%) of every combination of admission type and severity
+q2 <- data_clean %>%
+  group_by(admission_type, severity_level) %>%
+  summarise(admissions = n(),
+            deaths = sum(discharge_destination == "Deceased"),
+            mortality_rate = round(mean(discharge_destination == "Deceased") * 100, 1),
+            .groups = "drop") %>%
+  arrange(desc(mortality_rate))
+q2
+
+# Most dangerous combination with at least 20 stays (enough cases to be reliable)
+q2_reliable <- q2 %>% filter(admissions >= 20)
+q2_reliable[1, ]
+```
+
+```{r q2_chart}
+# Heat map: one tile per combination with its mortality rate and number of stays
+g2 <- ggplot(q2, aes(x = factor(severity_level), y = admission_type, fill = mortality_rate)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = paste0(mortality_rate, "%\n(", admissions, " stays)")), size = 4.5) +
+  scale_fill_gradient(low = "white", high = col_loss, guide = "none") +
+  labs(title = "Mortality rate by admission type and severity",
+       x = "Severity level (1 = minor, 4 = extreme)", y = NULL) +
+  theme_minimal(base_size = 15)
+g2
+ggsave("charts/q2_mortality.png", g2, width = 10, height = 5.6, dpi = 200, bg = "white")
+```
+
+**Answer:** The most dangerous combination is `r q2_reliable$admission_type[1]` admissions with severity level `r q2_reliable$severity_level[1]`: `r q2_reliable$mortality_rate[1]`% of these patients died (`r q2_reliable$deaths[1]` of `r q2_reliable$admissions[1]`). Transfers with severity `r q2$severity_level[1]` show `r q2$mortality_rate[1]`%, but they are only `r q2$admissions[1]` stays, too few to draw conclusions. Mortality grows with severity, and planned (elective) stays almost never end in death.
+
+## Question 3 – Admissions by day of the week
+
+*Count the admissions on each day of the week of admission_datetime and plot them. Which days are the busiest and what happens at weekends?*
+
+```{r q3}
+# Day of the week as a number (1 = Monday ... 7 = Sunday), then as a label
+day_names <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+q3 <- data_clean %>%
+  mutate(weekday = factor(day_names[wday(admission_datetime, week_start = 1)],
+                          levels = day_names)) %>%
+  count(weekday, name = "admissions")
+q3
+
+# Average admissions per weekday and per weekend day
+avg_weekday <- mean(q3$admissions[1:5])
+avg_weekend <- mean(q3$admissions[6:7])
+weekend_drop <- round((1 - avg_weekend / avg_weekday) * 100, 1)
+weekend_drop
+```
+
+```{r q3_chart}
+# Bar chart in calendar order, highlighting the weekend
+g3 <- ggplot(q3, aes(x = weekday, y = admissions, fill = weekday %in% c("Sat", "Sun"))) +
+  geom_col() +
+  geom_text(aes(label = admissions), vjust = -0.4, size = 5) +
+  scale_fill_manual(values = c(col_grey, col_main), guide = "none") +
+  labs(title = "Admissions by day of the week",
+       x = NULL, y = "Number of admissions") +
+  theme_minimal(base_size = 15)
+g3
+ggsave("charts/q3_weekday.png", g3, width = 10, height = 5.6, dpi = 200, bg = "white")
+```
+
+**Answer:** The busiest day is `r c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")[which.max(q3$admissions)]` (`r max(q3$admissions)` admissions) and admissions fall a little every day until Friday (`r q3$admissions[5]`). At weekends they drop: `r round(avg_weekend)` admissions per weekend day against `r round(avg_weekday)` per weekday, `r weekend_drop`% fewer, because almost no planned operations are scheduled on Saturday or Sunday.
+
+## Question 4 – Length of stay by age band
+
+*Group age into bands (0–17, 18–44, 45–64, 65–74, 75–84, 85 or more) using conditionals. Compute the average length of stay of each band and plot it. From which age does the length of stay rise sharply?*
+
+```{r q4}
+# Age bands with conditionals, then average length of stay of each band
+band_order <- c("0-17", "18-44", "45-64", "65-74", "75-84", "85 or more")
+q4 <- data_clean %>%
+  filter(!is.na(age)) %>%
+  mutate(age_band = case_when(
+    age <= 17 ~ "0-17",
+    age <= 44 ~ "18-44",
+    age <= 64 ~ "45-64",
+    age <= 74 ~ "65-74",
+    age <= 84 ~ "75-84",
+    TRUE ~ "85 or more"
+  )) %>%
+  mutate(age_band = factor(age_band, levels = band_order)) %>%
+  group_by(age_band) %>%
+  summarise(admissions = n(),
+            avg_los = round(mean(length_of_stay_days), 1)) %>%
+  mutate(increase_vs_previous = avg_los - lag(avg_los))
+q4
+```
+
+```{r q4_chart}
+# Bar chart in age order, highlighting the bands from 45 years
+g4 <- ggplot(q4, aes(x = age_band, y = avg_los, fill = age_band %in% band_order[3:6])) +
+  geom_col() +
+  geom_text(aes(label = paste(avg_los, "days")), vjust = -0.4, size = 5) +
+  scale_fill_manual(values = c(col_grey, col_main), guide = "none") +
+  labs(title = "Average length of stay by age band",
+       x = "Age band (years)", y = "Average length of stay (days)") +
+  theme_minimal(base_size = 15)
+g4
+ggsave("charts/q4_age.png", g4, width = 10, height = 5.6, dpi = 200, bg = "white")
+```
+
+**Answer:** The length of stay rises sharply from 45 years: it almost doubles from `r q4$avg_los[2]` days (18-44) to `r q4$avg_los[3]` days (45-64) and keeps growing in every band. The biggest jump is at 75-84 (+`r max(q4$increase_vs_previous, na.rm = TRUE)` days), and patients aged 85 or more stay `r q4$avg_los[6]` days, almost five times longer than children (`r q4$avg_los[1]` days).
+
+
+
+
+## Question 5 – Weekend admissions and length of stay
+
+*Patients admitted on a Friday or a Saturday stay longer than patients admitted from Tuesday to Thursday. Compute the average length of stay of both groups for all admissions, and then within each admission_type. Does the difference remain, shrink or reverse? Explain why.*
+
+```{r q5}
+# Label the two groups of days (Monday and Sunday are left out of the comparison)
+data_q5 <- data_clean %>%
+  mutate(day_number = wday(admission_datetime, week_start = 1),
+         day_group = case_when(
+           day_number %in% c(5, 6) ~ "Fri-Sat",
+           day_number %in% c(2, 3, 4) ~ "Tue-Thu"
+         )) %>%
+  filter(!is.na(day_group))
+
+# All admissions: average stay and share of planned (elective) stays in each group
+q5_all <- data_q5 %>%
+  group_by(day_group) %>%
+  summarise(admissions = n(),
+            avg_los = round(mean(length_of_stay_days), 2),
+            elective_share = round(mean(admission_type == "Elective") * 100, 1))
+q5_all
+
+# Within each admission type
+q5_type <- data_q5 %>%
+  group_by(admission_type, day_group) %>%
+  summarise(admissions = n(),
+            avg_los = round(mean(length_of_stay_days), 2), .groups = "drop")
+q5_type
+
+# Difference in days (Fri-Sat minus Tue-Thu) for each admission type
+q5_diff <- q5_type %>%
+  select(admission_type, day_group, avg_los) %>%
+  pivot_wider(names_from = day_group, values_from = avg_los) %>%
+  mutate(difference = round(`Fri-Sat` - `Tue-Thu`, 2))
+q5_diff
+diff_all <- round(q5_all$avg_los[1] - q5_all$avg_los[2], 2)
+```
+
+```{r q5_chart}
+# Grouped bars: both groups of days inside each admission type
+g5 <- ggplot(q5_type, aes(x = admission_type, y = avg_los, fill = day_group)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = round(avg_los, 1)), position = position_dodge(width = 0.9),
+            vjust = -0.4, size = 5) +
+  scale_fill_manual(values = c("Fri-Sat" = col_main, "Tue-Thu" = col_grey)) +
+  labs(title = "Average length of stay by day of admission and admission type",
+       x = NULL, y = "Average length of stay (days)", fill = "Admitted on") +
+  theme_minimal(base_size = 15)
+g5
+ggsave("charts/q5_weekend.png", g5, width = 10, height = 5.6, dpi = 200, bg = "white")
+```
+
+**Answer:** Overall, patients admitted on Friday or Saturday stay `r q5_all$avg_los[1]` days against `r q5_all$avg_los[2]` (+`r diff_all` days). Within emergencies, which are most of the stays, the difference shrinks to `r q5_diff$difference[q5_diff$admission_type == "Emergency"]` days, and for transfers it reverses (`r q5_diff$difference[q5_diff$admission_type == "Transfer in"]` days), although transfers are few. The overall gap comes mostly from the mix of patients: `r q5_all$elective_share[2]`% of Tuesday-Thursday admissions are short planned stays against only `r q5_all$elective_share[1]`% on Friday-Saturday, so the weekend groups are mainly longer emergency stays. Planned stays starting on Friday-Saturday are longer (+`r q5_diff$difference[q5_diff$admission_type == "Elective"]` days), but they are only `r q5_type$admissions[q5_type$admission_type == "Elective" & q5_type$day_group == "Fri-Sat"]` cases.
+
+## Question 6 – Concentration of cost
+
+*Sort the admissions by cost_eur from highest to lowest. What share of the total cost comes from the top 5% and from the top 10% of admissions? What share of the top 5% spent time in intensive care (icu_days above 0), compared with all admissions?*
+
+```{r q6}
+# Sort from the most to the least expensive stay
+sorted_cost <- data_clean %>% arrange(desc(cost_eur))
+head(sorted_cost %>% select(admission_id, diagnosis_group, length_of_stay_days, icu_days, cost_eur))
+
+# Number of stays in the top 5% and top 10%
+n_stays <- nrow(sorted_cost)
+n_top5  <- ceiling(n_stays * 0.05)
+n_top10 <- ceiling(n_stays * 0.10)
+total_cost <- sum(sorted_cost$cost_eur)
+
+# Share of the total cost of each group (%)
+share_top5  <- round(sum(sorted_cost$cost_eur[1:n_top5]) / total_cost * 100, 1)
+share_top10 <- round(sum(sorted_cost$cost_eur[1:n_top10]) / total_cost * 100, 1)
+
+# Share of stays with intensive care (%)
+icu_top5 <- round(mean(sorted_cost$icu_days[1:n_top5] > 0) * 100, 1)
+icu_all  <- round(mean(sorted_cost$icu_days > 0) * 100, 1)
+
+q6 <- data.frame(group = c("Top 5% of stays", "Top 10% of stays", "All stays"),
+                 stays = c(n_top5, n_top10, n_stays),
+                 share_of_total_cost = c(share_top5, share_top10, 100),
+                 icu_share = c(icu_top5, NA, icu_all))
+q6
+```
+
+```{r q6_chart}
+# Share of the stays versus share of the cost for the most expensive stays
+q6_chart <- data.frame(
+  group = rep(c("Top 5% most expensive", "Top 10% most expensive"), times = 2),
+  measure = rep(c("Share of stays", "Share of total cost"), each = 2),
+  value = c(5, 10, share_top5, share_top10)
+)
+# Keep the top 5% first in the chart
+q6_chart$group <- factor(q6_chart$group, levels = c("Top 5% most expensive", "Top 10% most expensive"))
+g6 <- ggplot(q6_chart, aes(x = group, y = value, fill = measure)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = paste0(value, "%")), position = position_dodge(width = 0.9),
+            vjust = -0.4, size = 5) +
+  scale_fill_manual(values = c("Share of stays" = col_grey, "Share of total cost" = col_main)) +
+  labs(title = "The most expensive stays take a large share of the cost",
+       x = NULL, y = "Share (%)", fill = NULL) +
+  theme_minimal(base_size = 15)
+g6
+ggsave("charts/q6_cost.png", g6, width = 10, height = 5.6, dpi = 200, bg = "white")
+```
+
+**Answer:** The `r n_top5` most expensive stays (top 5%) account for `r share_top5`% of the total cost, and the top 10% for `r share_top10`%. Intensive care explains a large part: `r icu_top5`% of the top 5% spent time in intensive care, against `r icu_all`% of all stays, almost `r round(icu_top5 / icu_all)` times more.
+
+## Question 7 – Margin by payer
+
+*Compute the margin of every admission. Add it up by payer. Which payers lose money for the hospital, and what share of all admissions lose money?*
+
+```{r q7}
+# Margin of every stay: amount paid minus cost
+data_clean <- data_clean %>% mutate(margin = reimbursement_eur - cost_eur)
+
+# Total and average margin by payer, and share of stays that lose money
+q7 <- data_clean %>%
+  group_by(payer) %>%
+  summarise(admissions = n(),
+            total_margin = round(sum(margin)),
+            avg_margin = round(mean(margin)),
+            loss_share = round(mean(margin < 0) * 100, 1)) %>%
+  arrange(total_margin)
+q7
+
+# Share of all stays that lose money and total margin of the hospital
+loss_share_all <- round(mean(data_clean$margin < 0) * 100, 1)
+total_margin_all <- sum(data_clean$margin)
+loss_share_all
+total_margin_all
+```
+
+```{r q7_chart}
+# Total margin by payer in thousands of euros: red for losses
+g7 <- ggplot(q7, aes(x = reorder(payer, total_margin), y = total_margin / 1000,
+                     fill = total_margin < 0)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(total_margin / 1000), "k €"),
+                vjust = ifelse(total_margin < 0, 1.4, -0.4)), size = 5) +
+  geom_hline(yintercept = 0) +
+  scale_fill_manual(values = c(col_main, col_loss), guide = "none") +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  labs(title = "Total margin by payer",
+       x = NULL, y = "Total margin (thousand €)") +
+  theme_minimal(base_size = 15)
+g7
+ggsave("charts/q7_margin.png", g7, width = 10, height = 5.6, dpi = 200, bg = "white")
+```
+
+**Answer:** Only `r q7$payer[1]` loses money: `r eur(q7$total_margin[1])` in total (`r eur(q7$avg_margin[1])` per stay), and `r q7$loss_share[1]`% of its `r q7$admissions[1]` stays lose money. The other payers are profitable, especially Private insurer (`r eur(q7$total_margin[q7$payer == "Private insurer"])`). Overall, `r loss_share_all`% of all stays lose money and the hospital as a whole has a margin of `r eur(total_margin_all)`, because the public agreement pays most of the stays.
+
+
+
+## Question 8 – Labelling the stays
+
+*Write a function that labels a stay "Very long" if length_of_stay_days is more than 14 or icu_days is 3 or more, "Long" if length_of_stay_days is more than 7, "Short" if it is less than 2, and "Normal" otherwise (check the rules in the order given). Apply it to every admission with a loop. Count the labels by department and compare the average cost_eur of the four labels.*
+
+```{r q8}
+# Function: checks the rules in the order given and returns the label
+label_stay <- function(los, icu) {
+  if (los > 14 | icu >= 3) {
+    return("Very long")
+  } else if (los > 7) {
+    return("Long")
+  } else if (los < 2) {
+    return("Short")
+  } else {
+    return("Normal")
+  }
+}
+
+# Loop: apply the function to every admission
+stay_label <- character(nrow(data_clean))
+for (i in 1:nrow(data_clean)) {
+  stay_label[i] <- label_stay(data_clean$length_of_stay_days[i], data_clean$icu_days[i])
+}
+data_clean$stay_label <- factor(stay_label, levels = c("Short", "Normal", "Long", "Very long"))
+
+# Number of stays of each label by department
+q8_dept <- data_clean %>%
+  count(department, stay_label) %>%
+  pivot_wider(names_from = stay_label, values_from = n, values_fill = 0)
+q8_dept
+
+# Number of stays and average cost of each label
+q8_cost <- data_clean %>%
+  group_by(stay_label) %>%
+  summarise(stays = n(),
+            avg_cost = round(mean(cost_eur)))
+q8_cost
+```
+
+```{r q8_chart}
+# Average cost of each label, from the shortest to the longest stays
+g8 <- ggplot(q8_cost, aes(x = stay_label, y = avg_cost, fill = stay_label == "Very long")) +
+  geom_col() +
+  geom_text(aes(label = eur(avg_cost)), vjust = -0.4, size = 5) +
+  scale_fill_manual(values = c(col_grey, col_main), guide = "none") +
+  labs(title = "Average cost of a stay by type of stay",
+       x = NULL, y = "Average cost per stay (€)") +
+  theme_minimal(base_size = 15)
+g8
+ggsave("charts/q8_labels.png", g8, width = 10, height = 5.6, dpi = 200, bg = "white")
+```
+
+**Answer:** A "Very long" stay costs on average `r eur(q8_cost$avg_cost[4])`, about `r round(q8_cost$avg_cost[4] / q8_cost$avg_cost[2], 1)` times a "Normal" stay (`r eur(q8_cost$avg_cost[2])`) and `r round(q8_cost$avg_cost[4] / q8_cost$avg_cost[1])` times a "Short" one (`r eur(q8_cost$avg_cost[1])`). There are `r q8_cost$stays[4]` very long stays (`r round(q8_cost$stays[4] / nrow(data_clean) * 100, 1)`% of all). By department, `r q8_dept$department[which.max(q8_dept[["Very long"]])]` has the most very long stays (`r max(q8_dept[["Very long"]])`), and it has more "Long" than "Normal" stays. General Surgery, Obstetrics and Paediatrics have almost only short and normal stays.
+
+## Question 9 – Patient satisfaction
+
+*How satisfied are patients with their stay in each department (if available)?*
+
+```{r q9}
+# Look for any column about satisfaction in the data
+names(data_clean)
+any(grepl("satisf", names(data_clean), ignore.case = TRUE))
+```
+
+**Answer:** This question cannot be answered: the data has no column about patient satisfaction (no survey score, complaint or rating), as the check above shows. To answer it the hospital would need a satisfaction survey for each stay (for example a score from 0 to 10 collected at discharge) linked to the `admission_id`, so it could be averaged by department.
+
+## Question 10 – One day less for knee and hip replacements
+
+*Suppose the hospital shortens by one day the stay of every knee and hip replacement. How many bed-days and how much cost would it save (use the cost per bed-day), and how many more operations of this type could be done in the freed beds (divide the freed bed-days by the new, shorter stay)?*
+
+```{r q10}
+# Cost per bed-day of the whole hospital
+cost_per_bedday <- sum(data_clean$cost_eur) / sum(data_clean$length_of_stay_days)
+round(cost_per_bedday, 2)
+
+# Knee and hip replacements
+joints <- data_clean %>%
+  filter(diagnosis_group %in% c("Knee replacement", "Hip replacement"))
+n_joints <- nrow(joints)
+
+# One day less for each of them
+beddays_saved <- n_joints * 1
+cost_saved <- beddays_saved * cost_per_bedday
+
+# Current and new (one day shorter) average stay of these operations
+current_los <- mean(joints$length_of_stay_days)
+new_los <- current_los - 1
+
+# Extra operations that fit in the freed bed-days (whole operations only)
+extra_operations <- floor(beddays_saved / new_los)
+
+q10 <- data.frame(measure = c("Knee and hip replacements", "Bed-days saved",
+                              "Cost per bed-day (€)", "Cost saved (€)",
+                              "Current average stay (days)", "New average stay (days)",
+                              "Extra operations possible"),
+                  value = c(n_joints, beddays_saved, round(cost_per_bedday),
+                            round(cost_saved), round(current_los, 2), round(new_los, 2),
+                            extra_operations))
+q10
+```
+
+**Answer:** There are `r n_joints` knee and hip replacements, so one day less each frees `r beddays_saved` bed-days. At `r eur(cost_per_bedday)` per bed-day, this saves about `r eur(cost_saved)`. With the shorter stay (from `r round(current_los, 1)` to `r round(new_los, 1)` days), the freed beds would allow `r extra_operations` more operations of this type per year.
+
+# 5. Conclusions
+
+* **The public agreement loses money:** it pays `r q7$admissions[1]` of the `r nrow(data_clean)` stays and generates a loss of `r eur(q7$total_margin[1])`; `r loss_share_all`% of all stays lose money. **Recommendation:** review the tariffs and the costs of the diagnoses with the largest losses with the regional health service.
+* **Few stays drive the cost:** the top 5% most expensive stays make up `r share_top5`% of the cost and `r icu_top5`% of them used intensive care (vs `r icu_all`%); a "Very long" stay costs `r eur(q8_cost$avg_cost[4])` on average. **Recommendation:** follow up long and intensive-care stays from the first days to plan the discharge.
+* **Older patients stay much longer:** from 45 years the stay grows in every band, up to `r q4$avg_los[6]` days for patients aged 85 or more. **Recommendation:** plan geriatric and social-care support (nursing homes, home care) before discharge, especially in winter.
+* **Shorter joint replacements free beds:** one day less in knee and hip replacements saves `r beddays_saved` bed-days (`r eur(cost_saved)`) or allows `r extra_operations` more operations. **Recommendation:** apply a fast-recovery protocol to these operations.
+* **Weekends:** admissions drop `r weekend_drop`% at weekends; the longer stays of Friday-Saturday admissions are mainly due to the type of patient, not the day.
